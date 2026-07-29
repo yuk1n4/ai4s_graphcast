@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Model weights & datasets — keep these out of git (see ai4s/README.md).
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+data/
+!**/data/.gitkeep
+
+# Logs & local env
+*.log
+.env
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
