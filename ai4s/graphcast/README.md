@@ -70,12 +70,12 @@ bash quickstart.sh all --steps 10
 
 ## Supported Platforms
 
-| Platform | Device | Backend | FlagGems | Status |
-|----------|--------|---------|----------|--------|
+| Platform | Device | Backend | FlagGems Ops | Status |
+|----------|--------|---------|-------------|--------|
 | NVIDIA H100 | `cuda` | native_cuda | — | ✓ |
-| Huawei Ascend 910C | `npu` | native_npu / flagos_ascend | 6/7 ops | ✓ |
-| Hygon BW1000 | `cuda` (HIP) | native_hygon / flagos_hygon | 4/7 ops | ✓ |
-| T-Head PPU-ZW810E | `cuda` (HGGC) | native_ptg / flagos_ptg | 5/7 ops | ✓ |
+| Huawei Ascend 910C | `npu` | native_npu / flagos_ascend | addmm, silu, layer_norm, cat, index, add (6/7, excl index_add_) | ✓ |
+| Hygon BW1000 | `cuda` (HIP) | native_hygon / flagos_hygon | addmm, silu, layer_norm, index (4/7, excl cat, add, index_add_) | ✓ |
+| T-Head PPU-ZW810E | `cuda` (HGGC) | native_ptg / flagos_ptg | addmm, silu, layer_norm, index, add (5/7, excl cat, index_add_) | ✓ |
 
 See `ai4s/docs/multi-platform-guide.md` for accelerator compliance requirements.
 
