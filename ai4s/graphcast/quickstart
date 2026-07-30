@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""GraphCast one-click quickstart — auto-detect platform, start container, run train/infer.
+
+Usage:
+  ./quickstart [MODE] [OPTIONS...]
+  ./quickstart train --steps 10 --flagos-mode flaggems
+  ./quickstart --rm infer
+  ./quickstart --container-only           # just start container, don't run anything
+  ./quickstart --image IMAGE train        # use custom Docker image
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+RELEASE_URL = (
+    "https://github.com/yuk1n4/ai4s_graphcast/releases/download/"
+    "v1.0-data-25km/graphcast_25km_data.tar.gz"
+)
+DATA_ARCHIVE = "graphcast_25km_data.tar.gz"
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# ── platform detection ──────────────────────────────────────────────────────
+
+GPU_CHECK_CMDS = {
+    "nvidia": [["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader"]],
+    "ascend": [["npu-smi", "info"]],
+    "hygon": [
+        ["rocm-smi", "--showmeminfo", "vram"],
+        ["/opt/dtk/bin/rocm-smi", "--showmeminfo", "vram"],
+    ],
+    "ppu": [[
+        "/usr/local/PPU_SDK/CUDA_SDK/bin/nvidia-smi",
+        "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader",
+    ]],
+}
+
+PLATFORM_CONFIG = {
+    "nvidia": {
+        "image": "chenwei/graphcast_flaggems5.0.2:latest",
+        "device_type": "cuda",
+        "docker_flags": ["--privileged", "--runtime=nvidia", "--gpus", "DEVICES"],
+        "mount_base": "/data/chenwei",
+    },
+    "ascend": {
+        "image": "chenwei/graphcast_flaggems5.3.0rc2:latest",
+        "device_type": "npu",
+        "docker_flags": [
+            "--runtime=ascend", "--privileged", "--security-opt", "label=disable",
+            "--entrypoint", "/bin/sh",
+        ],
+        "extra_volumes": [
+            "/usr/local/Ascend/driver:/usr/local/Ascend/driver:ro",
+            "/usr/local/dcmi:/usr/local/dcmi:ro",
+            "/usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro",
+            "/usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi:ro",
+            "/etc/ascend_install.info:/etc/ascend_install.info:ro",
+            "/etc/hccn.conf:/etc/hccn.conf:ro",
+        ],
+        "env_vars": {"ASCEND_RT_VISIBLE_DEVICES": "DEVICE_IDS",
+                     "PYTORCH_NPU_ALLOC_CONF": "max_split_size_mb:256"},
+        "mount_base": "/public-flash/chenwei",
+    },
+    "hygon": {
+        "image": "chenwei/graphcast_flaggems5.0.2:latest",
+        "device_type": "cuda",
+        "docker_flags": ["--security-opt", "seccomp=unconfined", "--network=host"],
+        "extra_devices": ["/dev/kfd", "/dev/dri"],
+        "extra_volumes": ["/opt/hyhal:/opt/hyhal:ro"],
+        "setup_cmd": "source /opt/dtk/env.sh 2>/dev/null",
+        "mount_base": "/public-flash/chenwei",
+    },
+    "ppu": {
+        "image": "chenwei/graphcast_flaggems5.3.0rc2_verified_5op:latest",
+        "device_type": "cuda",
+        "docker_flags": ["--network=host", "--shm-size=16g"],
+        "extra_devices": ["/dev/alixpu", "/dev/alixpu_ctl"],
+        "extra_volumes": [],
+        "mount_base": "/mnt/data/chenwei",
+    },
+}
+
+DATA_CANDIDATES = [
+    "/public-flash/chenwei/graphcast-data",
+    "/mnt/data/chenwei/graphcast-data",
+    "/data/chenwei/graphcast-data",
+]
+
+CONTAINER_NAME_PREFIX = "qs_graphcast"
+
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=False, text=True, **kwargs)
+
+
+def red(msg: str) -> str:   return f"\033[31m{msg}\033[0m"
+def green(msg: str) -> str: return f"\033[32m{msg}\033[0m"
+def bold(msg: str) -> str:  return f"\033[1m{msg}\033[0m"
+
+
+# ── GPU detection ───────────────────────────────────────────────────────────
+
+def detect_platform() -> str | None:
+    """Try each platform's GPU query tool; return first that succeeds."""
+    for name, cmd_list in GPU_CHECK_CMDS.items():
+        for cmd in cmd_list:
+            exe = cmd[0]
+            if shutil.which(exe) or os.path.exists(exe):
+                try:
+                    result = run(cmd, capture_output=True, timeout=15)
+                    if result.returncode == 0 and result.stdout.strip():
+                        return name
+                except Exception:
+                    continue
+    return None
+
+
+def find_free_gpus(platform: str, count: int = 4, user_spec: str | None = None
+                   ) -> list[int]:
+    """Return list of free GPU IDs (memory < 5 GB)."""
+    if user_spec:
+        return [int(x.strip()) for x in user_spec.split(",")]
+
+    cmds = GPU_CHECK_CMDS.get(platform, [])
+    if not cmds:
+        return list(range(count))
+
+    # Try each command variant until one succeeds
+    result = None
+    for cmd in cmds:
+        exe = cmd[0]
+        if shutil.which(exe) or os.path.exists(exe):
+            try:
+                result = run(cmd, capture_output=True, timeout=15)
+                if result.returncode == 0 and result.stdout.strip():
+                    break
+            except Exception:
+                continue
+
+    if result is None or result.returncode != 0:
+        return list(range(count))
+
+    free: list[int] = []
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if platform == "ascend":
+            # npu-smi format: | Chip Phy-ID | Bus-Id | ... Memory HBM-Used/HBM-Total |
+            parts = [p.strip() for p in line.split("|") if p.strip()]
+            if len(parts) >= 4:
+                mem_part = parts[3]
+                if "/" in mem_part:
+                    used_str = mem_part.split("/")[0].strip()
+                    try:
+                        if int(used_str) < 5000:
+                            free.append(int(parts[0]))
+                    except ValueError:
+                        continue
+        elif platform == "hygon":
+            # rocm-smi format: "HCU[0]: vram Total Used Memory (MiB): 2"
+            if "Total Used Memory" in line and "HCU[" in line:
+                import re
+                m_idx = re.search(r"HCU\[(\d+)\]", line)
+                m_mem = re.search(r"Used Memory \(MiB\):\s*(\d+)", line)
+                if m_idx and m_mem:
+                    if int(m_mem.group(1)) < 5000:
+                        free.append(int(m_idx.group(1)))
+        else:
+            # nvidia-smi CSV: index, memory.used [MiB], memory.total [MiB]
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 2:
+                try:
+                    idx = int(parts[0])
+                    mem = parts[1].split()[0]  # "2 MiB" -> "2"
+                    if int(mem) < 5000:
+                        free.append(idx)
+                except (ValueError, IndexError):
+                    continue
+
+    # Return first `count` free GPUs with smallest IDs
+    free.sort()
+    return free[:count]
+
+
+# ── data ────────────────────────────────────────────────────────────────────
+
+def ensure_data() -> bool:
+    """Ensure data/ directory has cases, stats, checkpoints, wheelhouse."""
+    data = SCRIPT_DIR / "data"
+    if (data / "cases" / "operational_25km").is_dir() and \
+       (data / "checkpoints" / "google_graphcast_operational_25km_compat_state.pt").is_file():
+        return True
+
+    print(bold("Data not found. Downloading (~1 GB)..."))
+    for tool, flag in [("curl", "-L -o"), ("wget", "-O")]:
+        if shutil.which(tool):
+            r = run(f"{tool} {flag} {DATA_ARCHIVE} {RELEASE_URL}".split(),
+                    cwd=SCRIPT_DIR, timeout=600)
+            break
+    else:
+        print(red("No curl/wget. Please download data manually:"))
+        print(red(f"  {RELEASE_URL}"))
+        return False
+
+    archive = SCRIPT_DIR / DATA_ARCHIVE
+    if archive.exists() and archive.stat().st_size > 0:
+        run(["tar", "-xzf", str(archive)], cwd=SCRIPT_DIR)
+        archive.unlink()
+        print(green("Data ready."))
+        return True
+
+    print(red("Download failed."))
+    return False
+
+
+def _symlink(src: Path, dst: Path) -> None:
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    dst.symlink_to(src)
+
+
+# ── Docker ───────────────────────────────────────────────────────────────────
+
+def container_name(platform: str) -> str:
+    return f"{CONTAINER_NAME_PREFIX}_{platform}"
+
+
+def container_running(name: str) -> bool:
+    r = run(["docker", "ps", "--filter", f"name={name}", "--format", "{{.Names}}"],
+            capture_output=True)
+    return name in r.stdout
+
+
+def container_exists(name: str) -> bool:
+    r = run(["docker", "container", "inspect", name], capture_output=True)
+    return r.returncode == 0
+
+
+def find_work_dir(cfg: dict) -> str:
+    """Find the working directory mount source (where graphcast-data lives)."""
+    base = cfg.get("mount_base", "")
+    if base and Path(base).is_dir():
+        return base
+    # Fallback: go up from SCRIPT_DIR and look for graphcast-data
+    for parent in SCRIPT_DIR.parents:
+        if (parent / "graphcast-data").is_dir():
+            return str(parent)
+    return base
+
+
+def start_container(platform: str, device_ids: list[int], image: str | None = None) -> bool:
+    """Start Docker container if not already running. Returns True if ready."""
+    name = container_name(platform)
+    if container_running(name):
+        print(f"Container {name} already running.")
+        return True
+    if container_exists(name):
+        run(["docker", "start", name])
+        print(f"Container {name} started.")
+        return True
+
+    cfg = PLATFORM_CONFIG[platform]
+    img = image or cfg["image"]
+    work_dir = find_work_dir(cfg)
+
+    # Build docker run command
+    cmd = ["docker", "run", "-d", "--name", name]
+
+    # Platform-specific flags
+    for flag in cfg.get("docker_flags", []):
+        if flag == "--gpus":
+            # Replace DEVICES placeholder with actual GPU spec
+            if platform == "ppu":
+                gpu_devs = " ".join(f"--device /dev/alixpu_ppu{i}" for i in device_ids)
+                cmd.extend([gpu_devs] if gpu_devs else [])
+            else:
+                gpu_list = ",".join(str(d) for d in device_ids)
+                cmd.extend(["--gpus", f"device={gpu_list}"])
+        elif flag == "DEVICES":
+            pass  # handled above
+        else:
+            cmd.append(flag)
+
+    # Extra devices
+    for dev in cfg.get("extra_devices", []):
+        cmd.extend(["--device", dev])
+
+    # PPU-specific: pass individual PPU devices
+    if platform == "ppu":
+        for i in device_ids:
+            cmd.extend(["--device", f"/dev/alixpu_ppu{i}"])
+
+    # Volumes: mount project dir
+    project_root = str(SCRIPT_DIR.parent.parent)  # ai4s_graphcast/
+    cmd.extend(["-v", f"{project_root}:/ws", "-w", "/ws/ai4s/graphcast"])
+
+    # Extra volumes
+    for vol in cfg.get("extra_volumes", []):
+        cmd.extend(["-v", vol])
+
+    # Env vars
+    for key, val in cfg.get("env_vars", {}).items():
+        if val == "DEVICE_IDS":
+            cmd.extend(["-e", f"{key}={','.join(str(d) for d in device_ids)}"])
+        else:
+            cmd.extend(["-e", f"{key}={val}"])
+
+    # Mount wheelhouse if found locally
+    wheelhouse = SCRIPT_DIR / "data" / "wheelhouse"
+    if wheelhouse.is_dir():
+        cmd.extend(["-v", f"{wheelhouse}:/wh:ro"])
+
+    cmd.extend([img, "sleep", "86400"])
+
+    print(bold(f"Starting container {name} ({platform}, GPUs {device_ids})..."))
+    r = run(cmd)
+    if r.returncode != 0:
+        print(red(f"Container start failed: {r.stderr}"))
+        return False
+    print(green(f"Container {name} running."))
+    return True
+
+
+def stop_container(platform: str) -> None:
+    name = container_name(platform)
+    run(["docker", "stop", name])
+    run(["docker", "rm", name])
+    print(f"Container {name} removed.")
+
+
+# ── main ────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="GraphCast one-click quickstart",
+        usage="./quickstart [MODE] [OPTIONS...]",
+    )
+    parser.add_argument("mode", nargs="?", default="infer",
+                        choices=["infer", "train", "all", "container-only"],
+                        help="Execution mode (default: infer)")
+    parser.add_argument("--rm", action="store_true",
+                        help="Remove container after execution")
+    parser.add_argument("--image", type=str, default=None,
+                        help="Docker image to use")
+    parser.add_argument("--devices", type=str, default=None,
+                        help="Comma-separated GPU/NPU IDs (e.g. 0,1,2,3)")
+    parser.add_argument("--steps", type=int, default=3,
+                        help="Training steps (default: 3)")
+    parser.add_argument("--flagos-mode", type=str, default=None,
+                        help="FlagOS mode: flaggems")
+    parser.add_argument("--flaggems-ops", type=str, default=None,
+                        help="FlagGems ops (comma-separated)")
+    parser.add_argument("--data-source", type=str, default=None,
+                        help="Path to graphcast-data directory")
+    # Catch-all for passing through to underlying scripts
+    parser.add_argument("extra", nargs=argparse.REMAINDER,
+                        help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    # 1. Detect platform
+    platform = detect_platform()
+    if not platform:
+        print(red("Could not detect platform. Tried: " +
+                  ", ".join(GPU_CHECK_CMDS)))
+        print(red("Specify platform manually via --platform (not yet implemented)."))
+        sys.exit(1)
+    print(f"Detected platform: {bold(platform)}")
+
+    # 2. Find free GPUs
+    devices = find_free_gpus(platform, user_spec=args.devices)
+    if len(devices) < 4 and args.mode in ("train", "all"):
+        print(red(f"Need 4 GPUs for training, found {len(devices)} free."))
+        print(red("Use --devices to specify GPUs manually."))
+        sys.exit(1)
+    print(f"Using GPUs: {devices}")
+
+    # 3. Ensure data
+    if not ensure_data():
+        sys.exit(1)
+
+    # 4. Start container
+    if not start_container(platform, devices, image=args.image):
+        sys.exit(1)
+
+    if args.mode == "container-only":
+        return
+
+    # 5. Run train / infer inside container
+    name = container_name(platform)
+    device_type = PLATFORM_CONFIG[platform]["device_type"]
+
+    def docker_exec(cmd_str: str) -> int:
+        setup = PLATFORM_CONFIG[platform].get("setup_cmd", "")
+        if setup:
+            cmd_str = f"{setup}; {cmd_str}"
+        full = ["docker", "exec", name, "bash", "-c", cmd_str]
+        return run(full, cwd=SCRIPT_DIR).returncode
+
+    extra_args = " ".join(shlex.quote(a) for a in args.extra)
+
+    if args.mode in ("infer", "all"):
+        print(bold("=== Inference ==="))
+        infer_cmd = (
+            f"python3 scripts/inference/run_google_small_inference.py"
+            f" --device {device_type}"
+            f" --config configs/inference/google_graphcast_operational_25km.yaml"
+            f" --weights data/checkpoints/google_graphcast_operational_25km_compat_state.pt"
+            f" --stats-dir data/stats"
+            f" --output /tmp/pred.nc --report /dev/null"
+            f" --synthetic-grid tiny"
+        )
+        docker_exec(infer_cmd)
+        print(green("Inference done."))
+
+    if args.mode in ("train", "all"):
+        print(bold("=== Training ==="))
+        train_env = ""
+        if args.flagos_mode:
+            train_env += (
+                f" GRAPHCAST_BACKEND=flagos_{platform}"
+                f" GRAPHCAST_FLAGOS_MODE={args.flagos_mode}"
+            )
+            if args.flaggems_ops:
+                train_env += f" GRAPHCAST_FLAGGEMS_OPS={args.flaggems_ops}"
+        train_cmd = (
+            f"{train_env} python3 -u scripts/training/lib/train_mp.py"
+            f" --steps {args.steps}"
+            f" --devices {device_type}:0,{device_type}:1,{device_type}:2,{device_type}:3"
+            f" --mesh2grid-grid-partitions 8"
+            f" --lr 1e-6 --optimizer sgd --train-scope all"
+        )
+        if args.flagos_mode:
+            train_cmd += f" --flagos-mode {args.flagos_mode}"
+        if args.flaggems_ops:
+            train_cmd += f" --flaggems-ops {args.flaggems_ops}"
+        docker_exec(train_cmd)
+        print(green("Training done."))
+
+    # 6. Cleanup
+    if args.rm:
+        stop_container(platform)
+
+
+if __name__ == "__main__":
+    main()

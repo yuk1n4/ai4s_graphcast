@@ -15,7 +15,7 @@ import trimesh
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILD_MESH_PATH = REPO_ROOT / "external/GraphCast_pytorch-main/src/build_mesh.py"
+BUILD_MESH_PATH = REPO_ROOT / "src/graphcast_compat/build_mesh.py"
 
 
 def _load_build_mesh() -> Any:

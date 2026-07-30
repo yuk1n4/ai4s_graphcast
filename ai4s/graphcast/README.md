@@ -7,65 +7,85 @@ Hygon BW1000, and T-Head PPU-ZW810E.
 ## Quick Start
 
 ```bash
-# One command — downloads data, runs inference (~30 sec)
-bash quickstart.sh
+# One command — auto-detects platform, starts Docker, runs inference
+./quickstart
 
-# Or step by step:
-# 1. Download data (one-time, ~1 GB)
-bash quickstart.sh infer    # auto-downloads if data/ missing
-
-# 2. Run training (4-GPU model parallel, 3 steps)
-bash quickstart.sh train
+# Or explicitly:
+./quickstart infer          # inference (default, ~30 sec)
+./quickstart train          # 4-GPU training, 3 steps
+./quickstart all            # train then infer
 ```
 
-The first run downloads the data archive (~1 GB) from GitHub Releases automatically.
+The first run downloads data (~1 GB) from GitHub Releases automatically if `data/` is missing.
+If Docker is available, quickstart auto-detects your GPU/NPU platform and starts a container.
 
-## quickstart.sh Usage
+## quickstart Usage
 
-```bash
-bash quickstart.sh [MODE] [OPTIONS...]
+```
+./quickstart [MODE] [OPTIONS...]
 ```
 
 ### Modes
 
-| Command | Action | Typical time |
-|---------|--------|-------------|
-| `bash quickstart.sh` | **Inference** (default) — fastest env check | ~30 sec |
-| `bash quickstart.sh infer` | Inference only | ~30 sec |
-| `bash quickstart.sh train` | Training only (4-GPU, 3 steps) | ~1-10 min |
-| `bash quickstart.sh all` | Train then infer | ~2-15 min |
+| Command | Action | Docker | Typical time |
+|---------|--------|--------|-------------|
+| `./quickstart` | **Inference** (default) | Auto | ~30 sec |
+| `./quickstart infer` | Inference only | Auto | ~30 sec |
+| `./quickstart train` | Training (4-GPU, 3 steps) | Auto | ~1-10 min |
+| `./quickstart all` | Train then infer | Auto | ~2-15 min |
+| `./quickstart container-only` | Start container, nothing else | Auto | ~5 sec |
 
-### Options (forwarded to train.sh / infer.sh)
+### Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--device DEV` | `cuda` | Accelerator: `cuda` (NVIDIA/Hygon/PPU) or `npu` (Ascend) |
-| `--steps N` | `3` | Training steps |
-| `--flagos-mode MODE` | `off` | `flagems` to enable FlagGems operator replacement |
-| `--flaggems-ops OPS` | (all 6) | Comma-separated list of FlagGems operators |
+| `--rm` | off | Remove Docker container after execution |
+| `--image IMAGE` | platform default | Custom Docker image |
+| `--devices a,b,c,d` | auto-detect | Comma-separated GPU/NPU IDs (e.g. `0,1,2,3`) |
+| `--steps N` | 3 | Training steps |
+| `--flagos-mode MODE` | off | `flaggems` to enable FlagGems |
+| `--flaggems-ops OPS` | all-6 | Comma-separated FlagGems ops |
+| `--data-source PATH` | — | Path to graphcast-data dir (skip download) |
+
+### Auto-Detection
+
+quickstart probes for `nvidia-smi`, `npu-smi`, `rocm-smi`, or PPU `nvidia-smi`
+to identify the platform, then selects 4 free GPUs (lowest IDs with < 5 GB memory).
+The correct Docker image and flags are chosen automatically.
+
+| Platform | Image | Container name |
+|----------|-------|---------------|
+| NVIDIA H100 | chenwei/graphcast_flaggems5.0.2 | `qs_graphcast_nvidia` |
+| Ascend 910C | chenwei/graphcast_flaggems5.3.0rc2 | `qs_graphcast_ascend` |
+| Hygon BW1000 | chenwei/graphcast_flaggems5.0.2 | `qs_graphcast_hygon` |
+| PPU-ZW810E | chenwei/graphcast_flaggems5.3.0rc2_verified_5op | `qs_graphcast_ppu` |
 
 ### Examples
 
 ```bash
-# Quick environment check (inference, default mode)
-bash quickstart.sh
+# Quick environment check
+./quickstart
 
-# Help
-bash quickstart.sh --help
+# Inference only, cleanup container after
+./quickstart --rm infer
 
-# 10-step native training
-bash quickstart.sh train --steps 10
+# Just start the container, don't run anything
+./quickstart container-only
 
-# Ascend FlagGems training (6 ops, excl index_add_)
-bash quickstart.sh train --device npu --flagos-mode flaggems \
+# Training with specific GPUs
+./quickstart train --devices 4,5,6,7 --steps 10
+
+# Hygon FlagGems training (4 ops)
+./quickstart train --flagos-mode flaggems \
+    --flaggems-ops "addmm,silu,layer_norm,index"
+
+# Ascend FlagGems training (6 ops)
+./quickstart train --flagos-mode flaggems \
     --flaggems-ops "addmm,silu,layer_norm,cat,index,add"
 
-# PPU FlagGems training (5 ops, excl cat + index_add_)
-bash quickstart.sh train --flagos-mode flaggems \
+# PPU FlagGems training (5 ops)
+./quickstart train --flagos-mode flaggems \
     --flaggems-ops "addmm,silu,layer_norm,index,add"
-
-# Full pipeline: train 10 steps then infer
-bash quickstart.sh all --steps 10
 ```
 
 ## Supported Platforms
@@ -120,9 +140,15 @@ bash scripts/infer.sh
 
 ## Data
 
-The quickstart script auto-downloads data from:
+quickstart auto-downloads data on first run from:
 ```
 https://github.com/yuk1n4/ai4s_graphcast/releases/download/v1.0-data-25km/graphcast_25km_data.tar.gz
+```
+
+Or download manually:
+```bash
+curl -LO https://github.com/yuk1n4/ai4s_graphcast/releases/download/v1.0-data-25km/graphcast_25km_data.tar.gz
+tar -xzf graphcast_25km_data.tar.gz
 ```
 
 Archive contents (~1 GB):
@@ -130,12 +156,9 @@ Archive contents (~1 GB):
 data/
 ├── cases/operational_25km/   # inputs.nc, targets.nc, forcings.nc
 ├── stats/                    # normalization statistics
-├── checkpoints/              # pretrained weights
+├── checkpoints/              # pretrained weights (137 MB)
 └── wheelhouse/               # offline Python packages (Ascend + PPU)
 ```
-
-Platform-specific guides in `graphcast_ds/docs/platforms/` cover Docker setup,
-GPU checks, and exact commands per accelerator.
 
 ## License
 
