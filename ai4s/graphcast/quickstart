@@ -46,7 +46,6 @@ PLATFORM_CONFIG = {
         "device_type": "cuda",
         "backend_suffix": "nvidia",
         "docker_flags": ["--privileged", "--runtime=nvidia", "--gpus=all"],
-        "mount_base": "/data/chenwei",
     },
     "ascend": {
         "image": "chenwei/graphcast_flaggems5.3.0rc2:latest",
@@ -67,7 +66,6 @@ PLATFORM_CONFIG = {
         "env_vars": {"ASCEND_RT_VISIBLE_DEVICES": "DEVICE_IDS",
                      "PYTORCH_NPU_ALLOC_CONF": "max_split_size_mb:256"},
         "setup_cmd": "python3 -c 'import xarray' 2>/dev/null || pip3 install -q --no-index --find-links=/wh/ascend xarray netCDF4 h5py trimesh rtree cftime PyYAML scipy",
-        "mount_base": "/public-flash/chenwei",
     },
     "hygon": {
         "image": "chenwei/graphcast_flaggems5.0.2:latest",
@@ -77,7 +75,6 @@ PLATFORM_CONFIG = {
         "extra_devices": ["/dev/kfd", "/dev/dri"],
         "extra_volumes": ["/opt/hyhal:/opt/hyhal:ro"],
         "setup_cmd": "source /opt/dtk/env.sh 2>/dev/null",
-        "mount_base": "/public-flash/chenwei",
     },
     "ppu": {
         "image": "chenwei/graphcast_flaggems5.3.0rc2_verified_5op:latest",
@@ -86,16 +83,9 @@ PLATFORM_CONFIG = {
         "docker_flags": ["--network=host", "--shm-size=16g"],
         "extra_devices": ["/dev/alixpu", "/dev/alixpu_ctl"],
         "extra_volumes": [],
-        "mount_base": "/mnt/data/chenwei",
         "docker_bin": "/etc/dsw/runtime/export_bin/docker",
     },
 }
-
-DATA_CANDIDATES = [
-    "/public-flash/chenwei/graphcast-data",
-    "/mnt/data/chenwei/graphcast-data",
-    "/data/chenwei/graphcast-data",
-]
 
 CONTAINER_NAME_PREFIX = "qs_graphcast"
 
@@ -233,13 +223,10 @@ def ensure_data() -> bool:
         return True
 
     print(red("Download failed."))
+    print(red(f"Please download manually from:"))
+    print(red(f"  {RELEASE_URL}"))
+    print(red(f"Then extract to: {SCRIPT_DIR / 'data'}"))
     return False
-
-
-def _symlink(src: Path, dst: Path) -> None:
-    if dst.exists() or dst.is_symlink():
-        dst.unlink()
-    dst.symlink_to(src)
 
 
 # ── Docker ───────────────────────────────────────────────────────────────────
@@ -266,18 +253,6 @@ def container_exists(name: str, platform: str) -> bool:
     d = docker_bin(platform)
     r = run(d + ["container", "inspect", name], capture_output=True)
     return r.returncode == 0
-
-
-def find_work_dir(cfg: dict) -> str:
-    """Find the working directory mount source (where graphcast-data lives)."""
-    base = cfg.get("mount_base", "")
-    if base and Path(base).is_dir():
-        return base
-    # Fallback: go up from SCRIPT_DIR and look for graphcast-data
-    for parent in SCRIPT_DIR.parents:
-        if (parent / "graphcast-data").is_dir():
-            return str(parent)
-    return base
 
 
 def _container_mount_ok(name: str, d: list[str]) -> bool:
@@ -315,7 +290,6 @@ def start_container(platform: str, device_ids: list[int], image: str | None = No
 
     cfg = PLATFORM_CONFIG[platform]
     img = image or cfg["image"]
-    work_dir = find_work_dir(cfg)
 
     # Build docker run command
     cmd = d + ["run", "-d", "--name", name]
