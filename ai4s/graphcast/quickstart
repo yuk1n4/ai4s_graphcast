@@ -414,8 +414,9 @@ def main() -> None:
 
     # 2. Find free GPUs
     devices = find_free_gpus(platform, user_spec=args.devices)
-    if len(devices) < 4 and args.mode in ("train", "all"):
-        print(red(f"Need 4 GPUs for training, found {len(devices)} free."))
+    min_devices = 2 if platform == "ascend" else 4
+    if len(devices) < min_devices and args.mode in ("train", "all"):
+        print(red(f"Need {min_devices} GPU(s) for training, found {len(devices)} free."))
         print(red("Use --devices to specify GPUs manually."))
         sys.exit(1)
     print(f"Using GPUs: {devices}")
@@ -467,10 +468,11 @@ def main() -> None:
             if args.flaggems_ops:
                 train_env_parts.append(f"GRAPHCAST_FLAGGEMS_OPS={args.flaggems_ops}")
         train_env = (" " + " ".join(train_env_parts)) if train_env_parts else ""
+        device_list = ",".join(f"{device_type}:{i}" for i in range(len(devices)))
         train_cmd = (
             f"{train_env} python3 -u scripts/training/lib/train_mp.py"
             f" --steps {args.steps}"
-            f" --devices {device_type}:0,{device_type}:1,{device_type}:2,{device_type}:3"
+            f" --devices {device_list}"
             f" --mesh2grid-grid-partitions 8"
             f" --lr 1e-6 --optimizer sgd --train-scope all"
         )
