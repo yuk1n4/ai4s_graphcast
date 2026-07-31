@@ -112,6 +112,10 @@ def bold(msg: str) -> str:  return f"\033[1m{msg}\033[0m"
 
 def detect_platform() -> str | None:
     """Try each platform's GPU query tool; return first that succeeds."""
+    # PPU machines have a working nvidia-smi in PATH, so detect by /dev/alixpu first
+    if os.path.exists("/dev/alixpu"):
+        return "ppu"
+
     for name, cmd_list in GPU_CHECK_CMDS.items():
         for cmd in cmd_list:
             exe = cmd[0]
@@ -273,17 +277,38 @@ def find_work_dir(cfg: dict) -> str:
     return base
 
 
+def _container_mount_ok(name: str, d: list[str]) -> bool:
+    """Verify the /ws volume mount is healthy inside the container."""
+    r = run(d + ["exec", "-w", "/", name, "test", "-f", "/ws/ai4s/graphcast/quickstart"],
+            capture_output=True)
+    return r.returncode == 0
+
+
 def start_container(platform: str, device_ids: list[int], image: str | None = None) -> bool:
     """Start Docker container if not already running. Returns True if ready."""
     name = container_name(platform)
     d = docker_bin(platform)
     if container_running(name, platform):
-        print(f"Container {name} already running.")
-        return True
+        if _container_mount_ok(name, d):
+            print(f"Container {name} already running.")
+            return True
+        # Mount broken — host directory was likely deleted and recreated.
+        # Restart the container to re-establish the bind mount.
+        print(f"Container {name} mount broken, restarting to fix...")
+        run(d + ["stop", name])
+        run(d + ["start", name])
+        print(f"Container {name} restarted.")
+        if _container_mount_ok(name, d):
+            return True
+        print(red(f"Container {name} mount still broken after restart."))
+        return False
     if container_exists(name, platform):
         run(d + ["start", name])
         print(f"Container {name} started.")
-        return True
+        if _container_mount_ok(name, d):
+            return True
+        print(red(f"Container {name} mount broken."))
+        return False
 
     cfg = PLATFORM_CONFIG[platform]
     img = image or cfg["image"]
