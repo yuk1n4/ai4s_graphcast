@@ -45,7 +45,7 @@ PLATFORM_CONFIG = {
     "nvidia": {
         "image": "chenwei/graphcast_flaggems5.0.2:latest",
         "device_type": "cuda",
-        "docker_flags": ["--privileged", "--runtime=nvidia", "--gpus", "DEVICES"],
+        "docker_flags": ["--privileged", "--runtime=nvidia", "--gpus=all"],
         "mount_base": "/data/chenwei",
     },
     "ascend": {
@@ -294,18 +294,7 @@ def start_container(platform: str, device_ids: list[int], image: str | None = No
 
     # Platform-specific flags
     for flag in cfg.get("docker_flags", []):
-        if flag == "--gpus":
-            # Replace DEVICES placeholder with actual GPU spec
-            if platform == "ppu":
-                gpu_devs = " ".join(f"--device /dev/alixpu_ppu{i}" for i in device_ids)
-                cmd.extend([gpu_devs] if gpu_devs else [])
-            else:
-                gpu_list = ",".join(str(d) for d in device_ids)
-                cmd.extend(["--gpus", f"device={gpu_list}"])
-        elif flag == "DEVICES":
-            pass  # handled above
-        else:
-            cmd.append(flag)
+        cmd.append(flag)
 
     # Extra devices
     for dev in cfg.get("extra_devices", []):
