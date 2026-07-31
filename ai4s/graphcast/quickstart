@@ -65,6 +65,7 @@ PLATFORM_CONFIG = {
         ],
         "env_vars": {"ASCEND_RT_VISIBLE_DEVICES": "DEVICE_IDS",
                      "PYTORCH_NPU_ALLOC_CONF": "max_split_size_mb:256"},
+        "setup_cmd": "python3 -c 'import xarray' 2>/dev/null || pip3 install -q --no-index --find-links=/wh/ascend xarray netCDF4 h5py trimesh rtree cftime PyYAML scipy",
         "mount_base": "/public-flash/chenwei",
     },
     "hygon": {
@@ -154,16 +155,21 @@ def find_free_gpus(platform: str, count: int = 4, user_spec: str | None = None
         if not line:
             continue
         if platform == "ascend":
-            # npu-smi format: | Chip Phy-ID | Bus-Id | ... Memory HBM-Used/HBM-Total |
+            # npu-smi format: | Chip Phy-ID | Bus-Id | AICore% Memory HBM-Used/HBM-Total |
+            # Column 3 contains both AICore% and memory: "0      0    / 0      3134 / 65536"
             parts = [p.strip() for p in line.split("|") if p.strip()]
-            if len(parts) >= 4:
-                mem_part = parts[3]
-                if "/" in mem_part:
-                    used_str = mem_part.split("/")[0].strip()
+            if len(parts) >= 3:
+                mem_col = parts[2]
+                tokens = mem_col.split("/")
+                if len(tokens) >= 2:
+                    used_str = tokens[-2].strip().split()[-1]
                     try:
                         if int(used_str) < 5000:
-                            free.append(int(parts[0]))
-                    except ValueError:
+                            # Chip column: "0     12" → extract "12" (physical ID)
+                            chip_parts = parts[0].split()
+                            pid = int(chip_parts[1]) if len(chip_parts) > 1 else int(chip_parts[0])
+                            free.append(pid)
+                    except (ValueError, IndexError):
                         continue
         elif platform == "hygon":
             # rocm-smi format: "HCU[0]: vram Total Used Memory (MiB): 2"
@@ -319,7 +325,12 @@ def start_container(platform: str, device_ids: list[int], image: str | None = No
     if wheelhouse.is_dir():
         cmd.extend(["-v", f"{wheelhouse}:/wh:ro"])
 
-    cmd.extend([img, "sleep", "86400"])
+    cmd.extend([img])
+    # Ascend FT3.5 image: entrypoint is /bin/sh, needs -c to pass command
+    if platform == "ascend":
+        cmd.extend(["-c", "sleep 86400"])
+    else:
+        cmd.extend(["sleep", "86400"])
 
     print(bold(f"Starting container {name} ({platform}, GPUs {device_ids})..."))
     r = run(cmd)
