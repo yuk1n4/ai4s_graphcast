@@ -84,6 +84,7 @@ PLATFORM_CONFIG = {
         "extra_devices": ["/dev/alixpu", "/dev/alixpu_ctl"],
         "extra_volumes": [],
         "mount_base": "/mnt/data/chenwei",
+        "docker_bin": "/etc/dsw/runtime/export_bin/docker",
     },
 }
 
@@ -240,14 +241,23 @@ def container_name(platform: str) -> str:
     return f"{CONTAINER_NAME_PREFIX}_{platform}"
 
 
-def container_running(name: str) -> bool:
-    r = run(["docker", "ps", "--filter", f"name={name}", "--format", "{{.Names}}"],
+def docker_bin(platform: str) -> list[str]:
+    """Return the docker CLI command for this platform."""
+    cfg = PLATFORM_CONFIG[platform]
+    path = cfg.get("docker_bin", "docker")
+    return [path]
+
+
+def container_running(name: str, platform: str) -> bool:
+    d = docker_bin(platform)
+    r = run(d + ["ps", "--filter", f"name={name}", "--format", "{{.Names}}"],
             capture_output=True)
     return name in r.stdout
 
 
-def container_exists(name: str) -> bool:
-    r = run(["docker", "container", "inspect", name], capture_output=True)
+def container_exists(name: str, platform: str) -> bool:
+    d = docker_bin(platform)
+    r = run(d + ["container", "inspect", name], capture_output=True)
     return r.returncode == 0
 
 
@@ -266,11 +276,12 @@ def find_work_dir(cfg: dict) -> str:
 def start_container(platform: str, device_ids: list[int], image: str | None = None) -> bool:
     """Start Docker container if not already running. Returns True if ready."""
     name = container_name(platform)
-    if container_running(name):
+    d = docker_bin(platform)
+    if container_running(name, platform):
         print(f"Container {name} already running.")
         return True
-    if container_exists(name):
-        run(["docker", "start", name])
+    if container_exists(name, platform):
+        run(d + ["start", name])
         print(f"Container {name} started.")
         return True
 
@@ -279,7 +290,7 @@ def start_container(platform: str, device_ids: list[int], image: str | None = No
     work_dir = find_work_dir(cfg)
 
     # Build docker run command
-    cmd = ["docker", "run", "-d", "--name", name]
+    cmd = d + ["run", "-d", "--name", name]
 
     # Platform-specific flags
     for flag in cfg.get("docker_flags", []):
@@ -343,8 +354,9 @@ def start_container(platform: str, device_ids: list[int], image: str | None = No
 
 def stop_container(platform: str) -> None:
     name = container_name(platform)
-    run(["docker", "stop", name])
-    run(["docker", "rm", name])
+    d = docker_bin(platform)
+    run(d + ["stop", name])
+    run(d + ["rm", name])
     print(f"Container {name} removed.")
 
 
@@ -414,7 +426,8 @@ def main() -> None:
         setup = PLATFORM_CONFIG[platform].get("setup_cmd", "")
         if setup:
             cmd_str = f"{setup}; {cmd_str}"
-        full = ["docker", "exec", name, "bash", "-c", cmd_str]
+        d = docker_bin(platform)
+        full = d + ["exec", name, "bash", "-c", cmd_str]
         return run(full, cwd=SCRIPT_DIR).returncode
 
     extra_args = " ".join(shlex.quote(a) for a in args.extra)
