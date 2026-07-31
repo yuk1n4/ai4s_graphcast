@@ -148,47 +148,72 @@ def find_free_gpus(platform: str, count: int = 4, user_spec: str | None = None
         return list(range(count))
 
     free: list[int] = []
-    for line in result.stdout.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        if platform == "ascend":
-            # npu-smi format: | Chip Phy-ID | Bus-Id | AICore% Memory HBM-Used/HBM-Total |
-            # Column 3 contains both AICore% and memory: "0      0    / 0      3134 / 65536"
+
+    if platform == "ascend":
+        # Ascend npu-smi has two row types interleaved:
+        #   Name row: | NPU_ID  Name | Health | Power Temp Hugepages |
+        #             → 0 or 1 slash, col1 = "0     Ascend910"
+        #   Chip row: | Chip  Phy-ID | Bus-Id | AICore% Mem/Total HBM/Total |
+        #             → 2 slashes, col1 = "0     12" (two integers)
+        # Chips within an NPU share resources; an NPU is usable only when
+        # ALL its chips are free.  Ascend 910B has 4 chips/NPU, 910C has 2.
+        # Return NPU logical IDs (0-7) — ASCEND_RT_VISIBLE_DEVICES uses these.
+        npu_chips: dict[int, dict[str, int]] = {}
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
             parts = [p.strip() for p in line.split("|") if p.strip()]
-            if len(parts) >= 3:
-                mem_col = parts[2]
-                tokens = mem_col.split("/")
-                if len(tokens) >= 2:
-                    used_str = tokens[-2].strip().split()[-1]
+            if len(parts) < 3 or parts[2].count("/") != 2:
+                continue
+            tokens = parts[2].split("/")
+            if len(tokens) < 3:
+                continue
+            try:
+                used_hbm = int(tokens[-2].strip().split()[-1])
+            except (ValueError, IndexError):
+                continue
+            chip_parts = parts[0].split()
+            if len(chip_parts) < 2:
+                continue
+            try:
+                phy_id = int(chip_parts[1])
+            except ValueError:
+                continue
+            npu_id = phy_id // 2
+            if npu_id not in npu_chips:
+                npu_chips[npu_id] = {"free": 0, "total": 0}
+            npu_chips[npu_id]["total"] += 1
+            if used_hbm < 5000:
+                npu_chips[npu_id]["free"] += 1
+        free = sorted(
+            nid for nid, s in npu_chips.items() if s["free"] == s["total"]
+        )
+    else:
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if platform == "hygon":
+                # rocm-smi format: "HCU[0]: vram Total Used Memory (MiB): 2"
+                if "Total Used Memory" in line and "HCU[" in line:
+                    import re
+                    m_idx = re.search(r"HCU\[(\d+)\]", line)
+                    m_mem = re.search(r"Used Memory \(MiB\):\s*(\d+)", line)
+                    if m_idx and m_mem:
+                        if int(m_mem.group(1)) < 5000:
+                            free.append(int(m_idx.group(1)))
+            else:
+                # nvidia-smi CSV: index, memory.used [MiB], memory.total [MiB]
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 2:
                     try:
-                        if int(used_str) < 5000:
-                            # Chip column: "0     12" → extract "12" (physical ID)
-                            chip_parts = parts[0].split()
-                            pid = int(chip_parts[1]) if len(chip_parts) > 1 else int(chip_parts[0])
-                            free.append(pid)
+                        idx = int(parts[0])
+                        mem = parts[1].split()[0]  # "2 MiB" -> "2"
+                        if int(mem) < 5000:
+                            free.append(idx)
                     except (ValueError, IndexError):
                         continue
-        elif platform == "hygon":
-            # rocm-smi format: "HCU[0]: vram Total Used Memory (MiB): 2"
-            if "Total Used Memory" in line and "HCU[" in line:
-                import re
-                m_idx = re.search(r"HCU\[(\d+)\]", line)
-                m_mem = re.search(r"Used Memory \(MiB\):\s*(\d+)", line)
-                if m_idx and m_mem:
-                    if int(m_mem.group(1)) < 5000:
-                        free.append(int(m_idx.group(1)))
-        else:
-            # nvidia-smi CSV: index, memory.used [MiB], memory.total [MiB]
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 2:
-                try:
-                    idx = int(parts[0])
-                    mem = parts[1].split()[0]  # "2 MiB" -> "2"
-                    if int(mem) < 5000:
-                        free.append(idx)
-                except (ValueError, IndexError):
-                    continue
 
     # Return first `count` free GPUs with smallest IDs
     free.sort()
