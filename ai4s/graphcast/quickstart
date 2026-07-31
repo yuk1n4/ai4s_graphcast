@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -398,11 +397,8 @@ def main() -> None:
                         help="FlagGems ops (comma-separated)")
     parser.add_argument("--data-source", type=str, default=None,
                         help="Path to graphcast-data directory")
-    # Catch-all for passing through to underlying scripts
-    parser.add_argument("extra", nargs=argparse.REMAINDER,
-                        help=argparse.SUPPRESS)
 
-    args = parser.parse_args()
+    args, extra = parser.parse_known_args()
 
     # 1. Detect platform
     platform = detect_platform()
@@ -444,8 +440,6 @@ def main() -> None:
         full = d + ["exec", name, "bash", "-c", cmd_str]
         return run(full, cwd=SCRIPT_DIR).returncode
 
-    extra_args = " ".join(shlex.quote(a) for a in args.extra)
-
     if args.mode in ("infer", "all"):
         print(bold("=== Inference ==="))
         infer_cmd = (
@@ -462,14 +456,13 @@ def main() -> None:
 
     if args.mode in ("train", "all"):
         print(bold("=== Training ==="))
-        train_env = ""
+        train_env_parts = []
         if args.flagos_mode:
-            train_env += (
-                f" GRAPHCAST_BACKEND=flagos_{platform}"
-                f" GRAPHCAST_FLAGOS_MODE={args.flagos_mode}"
-            )
+            train_env_parts.append(f"GRAPHCAST_BACKEND=flagos_{platform}")
+            train_env_parts.append(f"GRAPHCAST_FLAGOS_MODE={args.flagos_mode}")
             if args.flaggems_ops:
-                train_env += f" GRAPHCAST_FLAGGEMS_OPS={args.flaggems_ops}"
+                train_env_parts.append(f"GRAPHCAST_FLAGGEMS_OPS={args.flaggems_ops}")
+        train_env = (" " + " ".join(train_env_parts)) if train_env_parts else ""
         train_cmd = (
             f"{train_env} python3 -u scripts/training/lib/train_mp.py"
             f" --steps {args.steps}"
