@@ -150,110 +150,133 @@ def find_free_gpus(platform: str, count: int = 4, user_spec: str | None = None
     free: list[int] = []
 
     if platform == "ascend":
-        # ── Ascend: detect at NPU level, output at chip level ──
-        # npu-smi output interleaves Name rows (1 slash in col3) and Chip rows
-        # (2 slashes).  Chips within an NPU share resources — an NPU is usable
-        # only when ALL its chips are idle.  ASCEND_RT_VISIBLE_DEVICES needs
-        # chip physical IDs, so we return chip IDs from the selected NPUs.
-        # 910C has 2 chips/NPU, 910B has 4.  We auto-detect by counting.
-        chip_data: list[dict] = []  # [{phy_id, npu_id, used_hbm}, ...]
-        npu_chip_count: dict[int, int] = {}  # npu_id -> total chip count
-        for line in result.stdout.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            parts = [p.strip() for p in line.split("|") if p.strip()]
-            if len(parts) < 3 or parts[2].count("/") != 2:  # chip row only
-                continue
-            tokens = parts[2].split("/")
-            if len(tokens) < 3:
-                continue
-            try:
-                used_hbm = int(tokens[-2].strip().split()[-1])
-            except (ValueError, IndexError):
-                continue
-            chip_parts = parts[0].split()
-            if len(chip_parts) < 2:
-                continue
-            try:
-                phy_id = int(chip_parts[1])
-            except ValueError:
-                continue
-            npu_id = phy_id // 2
-            chip_data.append({"phy_id": phy_id, "npu_id": npu_id, "used_hbm": used_hbm})
-            npu_chip_count[npu_id] = npu_chip_count.get(npu_id, 0) + 1
+        free = _find_free_ascend(result, count)
+    elif platform == "hygon":
+        free = _find_free_hygon(result, count)
+    else:
+        free = _find_free_nvidia(result, count)
 
-        # Determine NPU freedom: all chips < 5GB AND no process on any chip
-        npu_free: dict[int, bool] = {}
-        for cd in chip_data:
-            nid = cd["npu_id"]
-            if nid not in npu_free:
-                npu_free[nid] = True
-            if cd["used_hbm"] >= 5000:
-                npu_free[nid] = False
-
-        # Also check process list — a process on any chip blocks the whole NPU.
-        in_process_section = False
-        for line in result.stdout.strip().split("\n"):
-            if "Process id" in line:
-                in_process_section = True
-                continue
-            if not in_process_section:
-                continue
-            line = line.strip()
-            if not line or line.startswith("+"):
-                continue
-            if "No running processes" in line:
-                continue
-            # Process row: | NPU_ID  Chip_ID | ... |
-            # Split by |; row[0] is empty (leading |), data starts at row[1]
-            row = [p.strip() for p in line.split("|")]
-            if len(row) >= 2:
-                ids = row[1].split()
-                if ids:
-                    try:
-                        npu_free[int(ids[0])] = False
-                    except (ValueError, KeyError):
-                        pass
-
-        free_npus = sorted(nid for nid, ok in npu_free.items() if ok)
-        # Select NPUs, then return all their chip IDs
-        chips_per_npu = npu_chip_count.get(free_npus[0], 2) if free_npus else 2
-        needed_npus = (count + chips_per_npu - 1) // chips_per_npu  # ceil
-        selected_npus = free_npus[:needed_npus]
-        for cd in chip_data:
-            if cd["npu_id"] in selected_npus:
-                free.append(cd["phy_id"])
-        free.sort()
-        return free[:count]
-        for line in result.stdout.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            if platform == "hygon":
-                # rocm-smi format: "HCU[0]: vram Total Used Memory (MiB): 2"
-                if "Total Used Memory" in line and "HCU[" in line:
-                    import re
-                    m_idx = re.search(r"HCU\[(\d+)\]", line)
-                    m_mem = re.search(r"Used Memory \(MiB\):\s*(\d+)", line)
-                    if m_idx and m_mem:
-                        if int(m_mem.group(1)) < 5000:
-                            free.append(int(m_idx.group(1)))
-            else:
-                # nvidia-smi CSV: index, memory.used [MiB], memory.total [MiB]
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 2:
-                    try:
-                        idx = int(parts[0])
-                        mem = parts[1].split()[0]  # "2 MiB" -> "2"
-                        if int(mem) < 5000:
-                            free.append(idx)
-                    except (ValueError, IndexError):
-                        continue
-
-    # Return first `count` free GPUs with smallest IDs
     free.sort()
     return free[:count]
+
+
+def _find_free_ascend(result: subprocess.CompletedProcess, count: int) -> list[int]:
+    """Ascend: detect at NPU level, output at chip level.
+
+    npu-smi output interleaves Name rows (1 slash) and Chip rows (2 slashes).
+    Chips within an NPU share resources — NPU is usable only when ALL its
+    chips have HBM < 5 GB AND no process runs on any chip.
+    ASCEND_RT_VISIBLE_DEVICES expects chip physical IDs.  910C = 2 chips/NPU.
+    """
+    free: list[int] = []
+    chip_data: list[dict] = []  # [{phy_id, npu_id, used_hbm}, ...]
+    npu_chip_count: dict[int, int] = {}
+
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split("|") if p.strip()]
+        if len(parts) < 3 or parts[2].count("/") != 2:
+            continue  # skip name rows, keep chip rows only
+        tokens = parts[2].split("/")
+        if len(tokens) < 3:
+            continue
+        try:
+            used_hbm = int(tokens[-2].strip().split()[-1])
+        except (ValueError, IndexError):
+            continue
+        chip_parts = parts[0].split()
+        if len(chip_parts) < 2:
+            continue
+        try:
+            phy_id = int(chip_parts[1])
+        except ValueError:
+            continue
+        npu_id = phy_id // 2
+        chip_data.append({"phy_id": phy_id, "npu_id": npu_id, "used_hbm": used_hbm})
+        npu_chip_count[npu_id] = npu_chip_count.get(npu_id, 0) + 1
+
+    # NPU free if all its chips have HBM < 5 GB
+    npu_free: dict[int, bool] = {}
+    for cd in chip_data:
+        nid = cd["npu_id"]
+        if nid not in npu_free:
+            npu_free[nid] = True
+        if cd["used_hbm"] >= 5000:
+            npu_free[nid] = False
+
+    # Also exclude NPUs that have running processes
+    in_process_section = False
+    for line in result.stdout.strip().split("\n"):
+        if "Process id" in line:
+            in_process_section = True
+            continue
+        if not in_process_section:
+            continue
+        line = line.strip()
+        if not line or line.startswith("+"):
+            continue
+        if "No running processes" in line:
+            continue
+        # Process row: leading |, then "NPU_ID  Chip_ID" in second field
+        row = [p.strip() for p in line.split("|")]
+        if len(row) >= 2:
+            ids = row[1].split()
+            if ids:
+                try:
+                    npu_free[int(ids[0])] = False
+                except (ValueError, KeyError):
+                    pass
+
+    free_npus = sorted(nid for nid, ok in npu_free.items() if ok)
+    if not free_npus:
+        return free
+
+    chips_per_npu = npu_chip_count.get(free_npus[0], 2)
+    needed_npus = (count + chips_per_npu - 1) // chips_per_npu  # ceil
+    for cd in chip_data:
+        if cd["npu_id"] in free_npus[:needed_npus]:
+            free.append(cd["phy_id"])
+    return free
+
+
+def _find_free_hygon(result: subprocess.CompletedProcess, count: int) -> list[int]:
+    """Hygon: parse rocm-smi --showmeminfo vram output."""
+    free: list[int] = []
+    import re as _re
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Format: "HCU[0]: vram Total Used Memory (MiB): 2"
+        if "Total Used Memory" in line and "HCU[" in line:
+            m_idx = _re.search(r"HCU\[(\d+)\]", line)
+            m_mem = _re.search(r"Used Memory \(MiB\):\s*(\d+)", line)
+            if m_idx and m_mem:
+                if int(m_mem.group(1)) < 5000:
+                    free.append(int(m_idx.group(1)))
+    return free
+
+
+def _find_free_nvidia(result: subprocess.CompletedProcess, count: int) -> list[int]:
+    """NVIDIA / generic: parse nvidia-smi CSV output."""
+    free: list[int] = []
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Format: "0, 0 MiB, 81559 MiB"
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 2:
+            try:
+                idx = int(parts[0])
+                mem = int(parts[1].split()[0])
+                if mem < 5000:
+                    free.append(idx)
+            except (ValueError, IndexError):
+                continue
+    return free
 
 
 # ── data ────────────────────────────────────────────────────────────────────
