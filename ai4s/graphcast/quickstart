@@ -44,12 +44,14 @@ PLATFORM_CONFIG = {
     "nvidia": {
         "image": "chenwei/graphcast_flaggems5.0.2:latest",
         "device_type": "cuda",
+        "backend_suffix": "nvidia",
         "docker_flags": ["--privileged", "--runtime=nvidia", "--gpus=all"],
         "mount_base": "/data/chenwei",
     },
     "ascend": {
         "image": "chenwei/graphcast_flaggems5.3.0rc2:latest",
         "device_type": "npu",
+        "backend_suffix": "ascend",
         "docker_flags": [
             "--runtime=ascend", "--privileged", "--security-opt", "label=disable",
             "--entrypoint", "/bin/sh",
@@ -70,6 +72,7 @@ PLATFORM_CONFIG = {
     "hygon": {
         "image": "chenwei/graphcast_flaggems5.0.2:latest",
         "device_type": "cuda",
+        "backend_suffix": "hygon",
         "docker_flags": ["--security-opt", "seccomp=unconfined", "--network=host"],
         "extra_devices": ["/dev/kfd", "/dev/dri"],
         "extra_volumes": ["/opt/hyhal:/opt/hyhal:ro"],
@@ -79,6 +82,7 @@ PLATFORM_CONFIG = {
     "ppu": {
         "image": "chenwei/graphcast_flaggems5.3.0rc2_verified_5op:latest",
         "device_type": "cuda",
+        "backend_suffix": "ptg",
         "docker_flags": ["--network=host", "--shm-size=16g"],
         "extra_devices": ["/dev/alixpu", "/dev/alixpu_ctl"],
         "extra_volumes": [],
@@ -458,7 +462,8 @@ def main() -> None:
         print(bold("=== Training ==="))
         train_env_parts = []
         if args.flagos_mode:
-            train_env_parts.append(f"GRAPHCAST_BACKEND=flagos_{platform}")
+            backend_suffix = PLATFORM_CONFIG[platform].get("backend_suffix", platform)
+            train_env_parts.append(f"GRAPHCAST_BACKEND=flagos_{backend_suffix}")
             train_env_parts.append(f"GRAPHCAST_FLAGOS_MODE={args.flagos_mode}")
             if args.flaggems_ops:
                 train_env_parts.append(f"GRAPHCAST_FLAGGEMS_OPS={args.flaggems_ops}")
