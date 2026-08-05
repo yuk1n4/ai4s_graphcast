@@ -457,6 +457,9 @@ def main() -> None:
                         help="FlagOS mode: flaggems")
     parser.add_argument("--flaggems-ops", type=str, default=None,
                         help="FlagGems ops (comma-separated)")
+    parser.add_argument("--tf32", type=str, default=None,
+                        choices=["on", "off"],
+                        help="Override TF32 setting (default: platform-specific)")
     parser.add_argument("--data-source", type=str, default=None,
                         help="Path to graphcast-data directory")
 
@@ -539,6 +542,20 @@ def main() -> None:
             train_cmd += f" --flagos-mode {args.flagos_mode}"
         if args.flaggems_ops:
             train_cmd += f" --flaggems-ops {args.flaggems_ops}"
+
+        # TF32: off by default on all platforms, enable with --tf32 on
+        if args.tf32 == "on":
+            train_cmd = (
+                'python3 -c "import torch; torch.set_float32_matmul_precision(\'high\')" && '
+                + train_cmd
+            )
+            print("  TF32: on")
+        else:
+            train_cmd = (
+                'python3 -c "import torch; torch.set_float32_matmul_precision(\'highest\')" && '
+                + train_cmd
+            )
+
         docker_exec(train_cmd)
         print(green("Training done."))
 
